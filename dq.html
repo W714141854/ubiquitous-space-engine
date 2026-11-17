@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>帮 TA 扫个签到码</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #101418; color: #e9eef3; display: flex; flex-direction: column;
+    min-height: 100vh; align-items: center; padding: 18px 16px 28px;
+  }
+  h1 { font-size: 17px; margin: 4px 0 6px; text-align: center; }
+  p.sub { font-size: 12.5px; color: #93a1b0; margin: 0 0 14px; text-align: center; line-height: 1.6; }
+  #stage {
+    position: relative; width: 100%; max-width: 420px; aspect-ratio: 1/1;
+    border-radius: 14px; overflow: hidden; background: #000;
+    border: 1px solid #263039;
+  }
+  #video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  #frame {
+    position: absolute; inset: 12%; border: 2px solid #35d07f; border-radius: 12px;
+    box-shadow: 0 0 0 9999px rgba(0,0,0,.28);
+  }
+  #hint {
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 8px 10px;
+    font-size: 12px; background: rgba(0,0,0,.55); text-align: center;
+  }
+  button {
+    margin-top: 14px; width: 100%; max-width: 420px; padding: 13px;
+    font-size: 15px; border: 0; border-radius: 12px; background: #35d07f; color: #06130b;
+    font-weight: 700;
+  }
+  button.ghost { background: #1c2530; color: #cfd9e2; font-weight: 500; }
+  #done {
+    display: none; text-align: center; padding: 26px 18px; max-width: 420px;
+    background: #14261c; border: 1px solid #2c5c42; border-radius: 14px; width: 100%;
+  }
+  #done .big { font-size: 40px; }
+  #done .t { font-size: 16px; font-weight: 700; margin: 8px 0 6px; }
+  #done .s { font-size: 12.5px; color: #9fb3a7; line-height: 1.6; }
+  code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px;
+         background: #0d1116; padding: 2px 6px; border-radius: 5px; word-break: break-all; }
+</style>
+</head>
+<body>
+
+<h1>帮 TA 扫个签到码</h1>
+<p class="sub">对准老师投屏的二维码，识别到一次就自动发回去，你不用登录任何东西。</p>
+
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <div id="frame"></div>
+  <div id="hint">准备相机…</div>
+</div>
+
+<button id="start">开始扫码</button>
+<button id="manual" class="ghost">识别不出来？手动粘贴</button>
+
+<div id="done">
+  <div class="big">✅</div>
+  <div class="t">已经发回去了</div>
+  <div class="s">TA 的手机会自动完成签到，你这边不用再做什么。<br><span id="echo"></span></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script>
+(function () {
+  // topic 从 #t=xxx 取，也兼容 ?t=xxx
+  var hash = location.hash.replace(/^#/, '');
+  var params = new URLSearchParams(hash || location.search.replace(/^\?/, ''));
+  var TOPIC = params.get('t') || '';
+  var RELAY = params.get('r') || 'https://ntfy.sh';
+
+  var video = document.getElementById('video');
+  var hint = document.getElementById('hint');
+  var done = document.getElementById('done');
+  var echo = document.getElementById('echo');
+  var stage = document.getElementById('stage');
+  var startBtn = document.getElementById('start');
+  var manualBtn = document.getElementById('manual');
+
+  var canvas = document.createElement('canvas');
+  var ctx = canvas.getContext('2d', { willReadFrequently: true });
+  var stream = null, raf = 0, sent = false;
+
+  function say(t) { hint.textContent = t; }
+
+  // 从扫码文本里抠 enc：enc=xxx / SIGNIN:xxx / 裸串
+  function extractEnc(text) {
+    if (!text) return '';
+    text = String(text).trim();
+    var i = text.indexOf('enc=');
+    if (i >= 0) {
+      var seg = text.slice(i + 4);
+      var stops = ['&', '#', ' ', '\n', '?'];
+      for (var k = 0; k < stops.length; k++) {
+        var j = seg.indexOf(stops[k]);
+        if (j >= 0) seg = seg.slice(0, j);
+      }
+      return seg.trim();
+    }
+    if (/^signin:/i.test(text)) return text.slice(7).trim();
+    if (text.indexOf('/') < 0 && text.indexOf(' ') < 0 && text.length >= 8) return text;
+    return '';
+  }
+
+  function finish(enc, raw) {
+    if (sent) return;
+    sent = true;
+    cancelAnimationFrame(raf);
+    if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+    stage.style.display = 'none';
+    startBtn.style.display = 'none';
+    manualBtn.style.display = 'none';
+    done.style.display = 'block';
+    echo.innerHTML = '编码 <code>' + enc.replace(/[<>&]/g, '') + '</code>';
+    say('已发送');
+
+    if (!TOPIC) {
+      echo.innerHTML = '⚠ 这个链接没带 topic，把上面这串编码发给 TA 就行';
+      return;
+    }
+    fetch(RELAY + '/' + encodeURIComponent(TOPIC), {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: enc
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+    }).catch(function (e) {
+      echo.innerHTML = '⚠ 自动回传失败（' + e.message + '），把编码发给 TA 手动填：<br><code>' +
+        enc.replace(/[<>&]/g, '') + '</code>';
+    });
+  }
+
+  function tick() {
+    if (sent) return;
+    if (video.readyState === video.HAVE_ENOUGH_DATA) {
+      var w = video.videoWidth, h = video.videoHeight;
+      if (w && h) {
+        canvas.width = w; canvas.height = h;
+        ctx.drawImage(video, 0, 0, w, h);
+        var img = ctx.getImageData(0, 0, w, h);
+        var code = window.jsQR ? jsQR(img.data, w, h, { inversionAttempts: 'dontInvert' }) : null;
+        if (code && code.data) {
+          var enc = extractEnc(code.data);
+          if (enc) { finish(enc, code.data); return; }
+          say('扫到了但不是签到码，继续对准');
+        }
+      }
+    }
+    raf = requestAnimationFrame(tick);
+  }
+
+  async function boot() {
+    if (!TOPIC) say('⚠ 链接没带 topic，可以扫，但结果要手动发回去');
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      say('这个浏览器不支持相机，用微信自带扫一扫吧');
+      return;
+    }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play().catch(function () {});
+      say('对准二维码…');
+      tick();
+    } catch (e) {
+      say('相机打不开（' + (e.name || '错误') + '），允许权限后重试，或手动粘贴');
+    }
+  }
+
+  startBtn.addEventListener('click', boot);
+
+  manualBtn.addEventListener('click', function () {
+    var v = prompt('把扫码结果整段粘贴进来（含 enc= 或 SIGNIN: 都行）');
+    if (!v) return;
+    var enc = extractEnc(v);
+    if (!enc) { alert('没认出 enc，把原文发回给 TA 手动填吧'); return; }
+    finish(enc, v);
+  });
+
+  // 微信内置浏览器点开就尝试起相机（部分版本要用户点一下才行）
+  if (TOPIC) boot();
+})();
+</script>
+</body>
+</html>
